@@ -206,6 +206,15 @@
   .seg-edit-row .name { font-size: 14px; }
   .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
 
+  .sync-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--soft-bg); border: 1px solid var(--border); color: var(--text-muted); }
+  .sync-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .sync-badge.ok .dot { background: var(--income); }
+  .sync-badge.saving .dot { background: var(--warn); }
+  .sync-badge.error { color: var(--expense); border-color: var(--expense); }
+  .sync-badge.error .dot { background: var(--expense); }
+  .migrate-banner { display: none; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; padding: 14px 16px; border-radius: 10px; background: var(--info-bg); border: 1px solid var(--info-border); font-size: 13px; line-height: 1.6; }
+  .migrate-banner strong { font-weight: 700; }
+
   @media (max-width: 760px) {
     .summary-grid { grid-template-columns: repeat(2, 1fr); }
     form.entry-form { grid-template-columns: repeat(2, 1fr); }
@@ -216,11 +225,21 @@
     .seg-edit-row .budget-cell { grid-column: 2 / span 2; }
   }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 </head>
 <body>
 <div class="container">
   <h1>가계부</h1>
   <div class="subtitle">결제수단별로 기록하고, 지난달·3개월 평균과 비교해 절감 목표를 잡아보세요</div>
+  <div style="margin:10px 0 18px;"><span class="sync-badge" id="syncBadge"><span class="dot"></span><span id="syncText">연결 중…</span></span></div>
+
+  <div class="migrate-banner" id="migrateBanner">
+    <div style="flex:1; min-width:220px;">
+      이 브라우저에 <strong id="migrateCount">0건</strong>의 예전 내역이 남아 있습니다. Supabase는 아직 비어 있어요.
+    </div>
+    <button type="button" class="btn-primary btn-small" id="migrateBtn">Supabase로 옮기기</button>
+    <button type="button" class="btn-secondary btn-small" id="migrateDismissBtn">나중에</button>
+  </div>
 
   <!-- 비서 -->
   <div class="card">
@@ -459,14 +478,26 @@
         <input type="file" id="importFile" accept="application/json" style="display:none;">
       </div>
     </div>
-    <div class="no-data">데이터는 이 브라우저에만 저장됩니다. 내보내기로 백업 파일을 만들어 두세요. (백업 파일에는 예산·결제수단 설정도 함께 저장됩니다)</div>
+    <div class="no-data">데이터는 Supabase 데이터베이스에 저장되며, 같은 주소로 접속한 모든 기기에서 함께 보입니다. 내보내기로 백업 파일을 만들어 두면 안전합니다. (백업 파일에는 예산·결제수단 설정도 함께 저장됩니다)</div>
   </div>
 </div>
 
 <script>
 (function () {
-  const STORAGE_KEY = 'household_ledger_transactions_v1';
-  const SETTINGS_KEY = 'household_ledger_settings_v1';
+  /* ---------- Supabase 연결 ---------- */
+  // publishable 키는 브라우저에 공개되는 값입니다. 실제 접근 권한은 DB의 RLS 정책이 결정합니다.
+  const SUPABASE_URL = 'https://pvbcnfmahvediakhcujf.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_I1mJ7mDgImKAj59v5cr_hA_2LH_c95t';
+
+  const db = window.supabase
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } })
+    : null;
+
+  // 서버에서 받아온 상태를 그대로 비춰두는 캐시. 첫 화면을 즉시 그리고, 잠깐 끊겨도 보이게 합니다.
+  const CACHE_KEY = 'household_ledger_cache_v2';
+  // v1 localStorage 데이터는 "옮기기" 원본으로만 읽고, 덮어쓰지 않습니다.
+  const LEGACY_TX_KEY = 'household_ledger_transactions_v1';
+  const LEGACY_SETTINGS_KEY = 'household_ledger_settings_v1';
 
   const CATEGORIES = {
     expense: ['식비','교통','주거/통신','생활용품','의료/건강','문화/여가','쇼핑','교육','기타'],
@@ -485,37 +516,232 @@
   let editingId = null;
   let compareMode = 'category';
 
-  /* ---------- 저장 / 로드 ---------- */
-  function loadData() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      transactions = raw ? JSON.parse(raw) : [];
-    } catch (e) { transactions = []; }
-    transactions.forEach(normalizeTx);
-
-    try {
-      const raw = localStorage.getItem(SETTINGS_KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
-        settings.segments = Array.isArray(s.segments) && s.segments.length ? s.segments : DEFAULT_SEGMENTS.slice();
-        settings.budgets = s.budgets && typeof s.budgets === 'object' ? s.budgets : {};
-        settings.budgetTotal = Number(s.budgetTotal) || 0;
-        settings.savingTarget = Number(s.savingTarget) || 0;
-      }
-    } catch (e) {}
+  /* ---------- 동기화 상태 표시 ---------- */
+  function setSync(state, text) {
+    const badge = document.getElementById('syncBadge');
+    if (!badge) return;
+    badge.className = 'sync-badge ' + state;
+    document.getElementById('syncText').textContent = text;
   }
 
+  function errText(e) {
+    if (!e) return '알 수 없는 오류';
+    return e.message || e.hint || e.details || String(e);
+  }
+
+  function failed(action, e) {
+    console.error(action, e);
+    setSync('error', '저장 실패');
+    alert(action + '하지 못했습니다.\n\n' + errText(e) + '\n\n네트워크를 확인하고 다시 시도해 주세요.');
+  }
+
+  /* ---------- 행 <-> 객체 변환 ---------- */
   function normalizeTx(t) {
     if (!t.segment) t.segment = UNASSIGNED;
     if (typeof t.fixed !== 'boolean') t.fixed = false;
     t.amount = Number(t.amount) || 0;
+    return t;
   }
 
-  function saveData() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(transactions)); } catch (e) {}
+  function rowToTx(r) {
+    return normalizeTx({
+      id: r.id,
+      date: r.date,
+      type: r.type,
+      segment: r.segment,
+      category: r.category,
+      memo: r.memo || '',
+      amount: Number(r.amount) || 0,
+      fixed: !!r.fixed
+    });
   }
-  function saveSettings() {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) {}
+
+  function txToRow(t) {
+    return {
+      date: t.date,
+      type: t.type === 'income' ? 'income' : 'expense',
+      segment: t.segment || UNASSIGNED,
+      category: t.category || '기타',
+      memo: (t.memo || '').slice(0, 300),
+      amount: Math.round(Math.abs(Number(t.amount) || 0)),
+      fixed: !!t.fixed
+    };
+  }
+
+  function settingsToRow() {
+    return {
+      id: 1,
+      segments: settings.segments,
+      budgets: settings.budgets,
+      budget_total: Math.round(Number(settings.budgetTotal) || 0),
+      saving_target: Math.round(Number(settings.savingTarget) || 0),
+      updated_at: new Date().toISOString()
+    };
+  }
+
+  function applySettingsRow(r) {
+    settings.segments = Array.isArray(r.segments) && r.segments.length ? r.segments : DEFAULT_SEGMENTS.slice();
+    settings.budgets = r.budgets && typeof r.budgets === 'object' ? r.budgets : {};
+    settings.budgetTotal = Number(r.budget_total) || 0;
+    settings.savingTarget = Number(r.saving_target) || 0;
+  }
+
+  /* ---------- 로컬 캐시 ---------- */
+  // 시크릿 창이나 저장소가 막힌 환경에서는 localStorage 접근 자체가 예외를 던집니다.
+  function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function lsSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
+
+  function writeCache() {
+    lsSet(CACHE_KEY, JSON.stringify({ transactions, settings }));
+  }
+
+  function readCache() {
+    try {
+      const raw = lsGet(CACHE_KEY);
+      if (!raw) return false;
+      const c = JSON.parse(raw);
+      if (!Array.isArray(c.transactions)) return false;
+      transactions = c.transactions.map(normalizeTx);
+      if (c.settings) applySettingsRow({
+        segments: c.settings.segments,
+        budgets: c.settings.budgets,
+        budget_total: c.settings.budgetTotal,
+        saving_target: c.settings.savingTarget
+      });
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function readLegacyLocal() {
+    const out = { transactions: [], settings: null };
+    try {
+      const raw = lsGet(LEGACY_TX_KEY);
+      const arr = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(arr)) out.transactions = arr.map(normalizeTx);
+    } catch (e) {}
+    try {
+      const raw = lsGet(LEGACY_SETTINGS_KEY);
+      if (raw) out.settings = JSON.parse(raw);
+    } catch (e) {}
+    return out;
+  }
+
+  /* ---------- 서버 읽기 ---------- */
+  const PAGE = 1000;
+
+  async function fetchTransactions() {
+    const all = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db
+        .from('transactions')
+        .select('*')
+        .order('date', { ascending: false })
+        .order('id', { ascending: false })
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      all.push(...data);
+      if (data.length < PAGE) break;
+    }
+    return all.map(rowToTx);
+  }
+
+  async function loadData() {
+    const [txs, st] = await Promise.all([
+      fetchTransactions(),
+      db.from('settings').select('*').eq('id', 1).maybeSingle()
+    ]);
+    if (st.error) throw st.error;
+    transactions = txs;
+    if (st.data) applySettingsRow(st.data);
+    writeCache();
+  }
+
+  /* ---------- 서버 쓰기 ---------- */
+  // 모든 쓰기는 서버를 먼저 고치고, 성공했을 때만 화면 상태를 바꿉니다.
+  async function insertTx(tx) {
+    setSync('saving', '저장 중…');
+    const { data, error } = await db.from('transactions').insert(txToRow(tx)).select().single();
+    if (error) throw error;
+    transactions.unshift(rowToTx(data));
+    sortTransactions();
+    afterWrite();
+    return data;
+  }
+
+  async function insertManyTx(list) {
+    setSync('saving', `저장 중… (0/${list.length})`);
+    const CHUNK = 500;
+    let done = 0;
+    for (let i = 0; i < list.length; i += CHUNK) {
+      const rows = list.slice(i, i + CHUNK).map(txToRow);
+      const { data, error } = await db.from('transactions').insert(rows).select();
+      if (error) throw error;
+      data.forEach(r => transactions.push(rowToTx(r)));
+      done += data.length;
+      setSync('saving', `저장 중… (${done}/${list.length})`);
+    }
+    sortTransactions();
+    afterWrite();
+    return done;
+  }
+
+  async function updateTx(id, patch) {
+    setSync('saving', '저장 중…');
+    const { data, error } = await db.from('transactions').update(txToRow(patch)).eq('id', id).select().single();
+    if (error) throw error;
+    const i = transactions.findIndex(t => t.id === id);
+    if (i >= 0) transactions[i] = rowToTx(data);
+    sortTransactions();
+    afterWrite();
+  }
+
+  async function deleteTx(id) {
+    setSync('saving', '삭제 중…');
+    const { error } = await db.from('transactions').delete().eq('id', id);
+    if (error) throw error;
+    transactions = transactions.filter(t => t.id !== id);
+    afterWrite();
+  }
+
+  async function deleteAllTx() {
+    setSync('saving', '삭제 중…');
+    const { error } = await db.from('transactions').delete().gt('id', 0);
+    if (error) throw error;
+    transactions = [];
+    afterWrite();
+  }
+
+  async function reassignSegment(from, to) {
+    setSync('saving', '저장 중…');
+    const { error } = await db.from('transactions').update({ segment: to }).eq('segment', from);
+    if (error) throw error;
+    transactions.forEach(t => { if (t.segment === from) t.segment = to; });
+    afterWrite();
+  }
+
+  async function saveSettings() {
+    setSync('saving', '저장 중…');
+    const { error } = await db.from('settings').upsert(settingsToRow(), { onConflict: 'id' });
+    if (error) throw error;
+    afterWrite();
+  }
+
+  // saveSettings를 이벤트 핸들러에서 부를 때 쓰는 래퍼 (실패해도 화면은 유지)
+  function saveSettingsSafe() {
+    saveSettings().catch(e => failed('설정을 저장', e));
+  }
+
+  function sortTransactions() {
+    transactions.sort((a, b) => (a.date === b.date ? b.id - a.id : (a.date < b.date ? 1 : -1)));
+  }
+
+  function afterWrite() {
+    writeCache();
+    setSync('ok', '동기화됨');
   }
 
   /* ---------- 유틸 ---------- */
@@ -581,7 +807,11 @@
 
   /* ---------- 집계 ---------- */
   function agg(ym) {
-    const r = { ym, count: 0, income: 0, expense: 0, cat: {}, seg: {}, fixed: 0, variable: 0 };
+    // 월말 예상액은 고정비와 변동비를 다르게 계산해야 하므로, 분류·결제수단별로도 나눠 담습니다.
+    const r = {
+      ym, count: 0, income: 0, expense: 0, cat: {}, seg: {}, fixed: 0, variable: 0,
+      catFixed: {}, catVar: {}, segFixed: {}, segVar: {}
+    };
     transactions.forEach(t => {
       if (t.date.slice(0, 7) !== ym) return;
       r.count++;
@@ -589,6 +819,10 @@
       r.expense += t.amount;
       r.cat[t.category] = (r.cat[t.category] || 0) + t.amount;
       r.seg[t.segment] = (r.seg[t.segment] || 0) + t.amount;
+      const catBucket = t.fixed ? r.catFixed : r.catVar;
+      const segBucket = t.fixed ? r.segFixed : r.segVar;
+      catBucket[t.category] = (catBucket[t.category] || 0) + t.amount;
+      segBucket[t.segment] = (segBucket[t.segment] || 0) + t.amount;
       if (t.fixed) r.fixed += t.amount; else r.variable += t.amount;
     });
     return r;
@@ -599,16 +833,19 @@
     const months = [1, 2, 3].map(i => agg(shiftYM(ym, -i))).filter(m => m.count > 0);
     if (months.length === 0) return null;
     const n = months.length;
-    const out = { months: n, expense: 0, income: 0, variable: 0, fixed: 0, cat: {}, seg: {} };
+    const out = { months: n, expense: 0, income: 0, variable: 0, fixed: 0, cat: {}, seg: {}, catFixed: {}, segFixed: {} };
     months.forEach(m => {
       out.expense += m.expense; out.income += m.income;
       out.variable += m.variable; out.fixed += m.fixed;
       Object.entries(m.cat).forEach(([k, v]) => { out.cat[k] = (out.cat[k] || 0) + v; });
       Object.entries(m.seg).forEach(([k, v]) => { out.seg[k] = (out.seg[k] || 0) + v; });
+      Object.entries(m.catFixed).forEach(([k, v]) => { out.catFixed[k] = (out.catFixed[k] || 0) + v; });
+      Object.entries(m.segFixed).forEach(([k, v]) => { out.segFixed[k] = (out.segFixed[k] || 0) + v; });
     });
     ['expense', 'income', 'variable', 'fixed'].forEach(k => { out[k] = out[k] / n; });
-    Object.keys(out.cat).forEach(k => { out.cat[k] = out.cat[k] / n; });
-    Object.keys(out.seg).forEach(k => { out.seg[k] = out.seg[k] / n; });
+    [out.cat, out.seg, out.catFixed, out.segFixed].forEach(o => {
+      Object.keys(o).forEach(k => { o[k] = o[k] / n; });
+    });
     out.labels = [1, 2, 3].map(i => shiftYM(ym, -i)).reverse();
     return out;
   }
@@ -624,11 +861,26 @@
     return { dim, elapsed, remaining: Math.max(0, dim - elapsed), isCurrent: ym === cur, isFuture: ym > cur };
   }
 
-  function projectedExpense(cur, prog) {
-    if (!prog.isCurrent || prog.elapsed <= 0) return cur.expense;
-    return Math.round(cur.expense / prog.elapsed * prog.dim);
+  // 월세·통신비·학원비 같은 고정지출은 정해진 날에 한 번 빠져나가고 끝나므로,
+  // 경과일 비율로 늘려 잡으면 월초에 낸 금액이 그대로 부풀려집니다.
+  // 고정비는 "이번 달에 이미 나간 금액"과 "3개월 평균" 중 큰 쪽을 월말 확정액으로 보고
+  // (아직 결제일이 오지 않은 항목도 반영), 변동비만 남은 날짜만큼 환산합니다.
+  function projectPart(curFixed, curVar, baseFixed, prog) {
+    if (!prog.isCurrent || prog.elapsed <= 0) return curFixed + curVar;
+    const fixedPart = baseFixed > 0 ? Math.max(curFixed, baseFixed) : curFixed;
+    return fixedPart + curVar / prog.elapsed * prog.dim;
   }
-  function paceScale(prog) {
+  function projectedExpense(cur, prog, base) {
+    return Math.round(projectPart(cur.fixed, cur.variable, base ? base.fixed : 0, prog));
+  }
+  function projectCat(cur, base, k, prog) {
+    return Math.round(projectPart(cur.catFixed[k] || 0, cur.catVar[k] || 0, base ? (base.catFixed[k] || 0) : 0, prog));
+  }
+  function projectSeg(cur, base, k, prog) {
+    return Math.round(projectPart(cur.segFixed[k] || 0, cur.segVar[k] || 0, base ? (base.segFixed[k] || 0) : 0, prog));
+  }
+  // 변동비에만 쓰는 배율입니다. 고정비가 섞인 금액에는 쓰지 마세요.
+  function varScale(prog) {
     if (!prog.isCurrent || prog.elapsed <= 0) return 1;
     return prog.dim / prog.elapsed;
   }
@@ -711,7 +963,7 @@
     document.getElementById('statBalanceSub').innerHTML =
       prev.count ? `지난달 ${formatKo(prev.income - prev.expense)}` : '&nbsp;';
 
-    const projected = projectedExpense(cur, prog);
+    const projected = projectedExpense(cur, prog, base);
     document.getElementById('statProjected').textContent = formatWon(projected);
     document.getElementById('statProjectedSub').innerHTML = prog.isCurrent
       ? `${prog.elapsed}일 경과 · 하루 평균 ${formatKo(prog.elapsed ? cur.expense / prog.elapsed : 0)}`
@@ -911,8 +1163,8 @@
   function renderAssistant(ym, cur, prev, base, prog) {
     const box = document.getElementById('assistantBubbles');
     const bubbles = [];
-    const projected = projectedExpense(cur, prog);
-    const scale = paceScale(prog);
+    const projected = projectedExpense(cur, prog, base);
+    const scale = varScale(prog);
 
     if (transactions.length === 0) {
       bubbles.push({
@@ -971,7 +1223,7 @@
       /* 2) 항목별 증가 TOP */
       if (base) {
         const movers = Object.keys(Object.assign({}, cur.cat, base.cat)).map(k => {
-          const projCat = (cur.cat[k] || 0) * scale;
+          const projCat = projectCat(cur, base, k, prog);
           return { key: k, cur: cur.cat[k] || 0, proj: projCat, base: base.cat[k] || 0, gap: projCat - (base.cat[k] || 0) };
         });
         const up = movers.filter(m => m.gap >= 10000 && (m.base === 0 || m.gap / Math.max(m.base, 1) >= 0.12))
@@ -1002,7 +1254,7 @@
 
         /* 3) 결제수단 증가 */
         const segMovers = Object.keys(Object.assign({}, cur.seg, base.seg)).map(k => {
-          const proj = (cur.seg[k] || 0) * scale;
+          const proj = projectSeg(cur, base, k, prog);
           return { key: k, cur: cur.seg[k] || 0, proj, base: base.seg[k] || 0, gap: proj - (base.seg[k] || 0) };
         }).filter(m => m.gap >= 20000 && (m.base === 0 || m.gap / Math.max(m.base, 1) >= 0.15))
           .sort((a, b) => b.gap - a.gap).slice(0, 1);
@@ -1058,9 +1310,10 @@
       }
 
       /* 6) 신용카드 다음달 결제 예정 */
-      const cardTotal = Object.keys(cur.seg).filter(k => /카드값|신용/.test(k)).reduce((s, k) => s + cur.seg[k], 0);
+      const cardKeys = Object.keys(cur.seg).filter(k => /카드값|신용/.test(k));
+      const cardTotal = cardKeys.reduce((s, k) => s + cur.seg[k], 0);
       if (cardTotal > 0) {
-        const projCard = Math.round(cardTotal * scale);
+        const projCard = cardKeys.reduce((s, k) => s + projectSeg(cur, base, k, prog), 0);
         bubbles.push({
           tone: 'info', title: `다음 달 카드값 예정 ${formatKo(projCard)}`,
           text: `${ymLabel(ym)}에 신용카드로 <b>${pEul(formatWon(cardTotal))}</b> 썼어요${prog.isCurrent ? ` (월말 ${formatKo(projCard)} 예상)` : ''}. 이 금액은 다음 달 현금에서 빠져나갑니다 — 미리 떼어두면 카드값에 쫓기지 않아요.`
@@ -1124,7 +1377,7 @@
     }
   });
 
-  document.getElementById('entryForm').addEventListener('submit', function (e) {
+  document.getElementById('entryForm').addEventListener('submit', async function (e) {
     e.preventDefault();
     const date = document.getElementById('fDate').value;
     const type = document.getElementById('fType').value;
@@ -1136,28 +1389,40 @@
 
     if (!date || !amount || amount <= 0) return;
 
-    if (editingId !== null) {
-      const t = transactions.find(x => x.id === editingId);
-      if (t) Object.assign(t, { date, type, segment, category, memo, amount, fixed });
-    } else {
-      transactions.push({ id: Date.now(), date, type, segment, category, memo, amount, fixed });
+    const btn = document.getElementById('submitBtn');
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '저장 중…';
+    try {
+      const payload = { date, type, segment, category, memo, amount, fixed };
+      if (editingId !== null) await updateTx(editingId, payload);
+      else await insertTx(payload);
+      resetForm();
+      render();
+    } catch (err) {
+      failed('내역을 저장', err);
+      btn.textContent = label;
+    } finally {
+      btn.disabled = false;
     }
-    saveData();
-    resetForm();
-    render();
   });
 
   document.getElementById('cancelEditBtn').addEventListener('click', resetForm);
 
-  document.getElementById('tableBody').addEventListener('click', function (e) {
+  document.getElementById('tableBody').addEventListener('click', async function (e) {
     const btn = e.target.closest('button');
     if (!btn) return;
     const id = Number(btn.dataset.id);
     if (btn.dataset.action === 'delete') {
       if (confirm('이 내역을 삭제할까요?')) {
-        transactions = transactions.filter(t => t.id !== id);
-        saveData();
-        render();
+        btn.disabled = true;
+        try {
+          await deleteTx(id);
+          render();
+        } catch (err) {
+          failed('내역을 삭제', err);
+          btn.disabled = false;
+        }
       }
     } else if (btn.dataset.action === 'edit') {
       const t = transactions.find(x => x.id === id);
@@ -1204,12 +1469,12 @@
   // 설정
   document.getElementById('budgetTotal').addEventListener('change', function () {
     settings.budgetTotal = Number(this.value) || 0;
-    saveSettings();
+    saveSettingsSafe();
     render();
   });
   document.getElementById('savingTarget').addEventListener('change', function () {
     settings.savingTarget = Number(this.value) || 0;
-    saveSettings();
+    saveSettingsSafe();
     render();
   });
   document.getElementById('segEditList').addEventListener('change', function (e) {
@@ -1218,10 +1483,10 @@
     const name = input.dataset.segBudget;
     const v = Number(input.value) || 0;
     if (v > 0) settings.budgets[name] = v; else delete settings.budgets[name];
-    saveSettings();
+    saveSettingsSafe();
     render();
   });
-  document.getElementById('segEditList').addEventListener('click', function (e) {
+  document.getElementById('segEditList').addEventListener('click', async function (e) {
     const btn = e.target.closest('[data-seg-del]');
     if (!btn) return;
     const name = btn.dataset.segDel;
@@ -1230,16 +1495,29 @@
       ? `"${name}"을 삭제하면 이 결제수단으로 기록된 ${used}건은 "${UNASSIGNED}"으로 바뀝니다. 계속할까요?`
       : `"${name}"을 삭제할까요?`;
     if (!confirm(msg)) return;
-    settings.segments = settings.segments.filter(s => s !== name);
-    delete settings.budgets[name];
-    if (used > 0) {
-      transactions.forEach(t => { if (t.segment === name) t.segment = UNASSIGNED; });
-      saveData();
+
+    btn.disabled = true;
+    try {
+      // 내역을 먼저 옮겨야, 중간에 실패해도 결제수단이 사라진 고아 내역이 남지 않습니다.
+      if (used > 0) await reassignSegment(name, UNASSIGNED);
+      const prevSegments = settings.segments;
+      const prevBudget = settings.budgets[name];
+      settings.segments = settings.segments.filter(s => s !== name);
+      delete settings.budgets[name];
+      try {
+        await saveSettings();
+      } catch (err) {
+        settings.segments = prevSegments;
+        if (prevBudget !== undefined) settings.budgets[name] = prevBudget;
+        throw err;
+      }
+      refreshAllSelects();
+      renderSettings();
+      render();
+    } catch (err) {
+      failed('결제수단을 삭제', err);
+      btn.disabled = false;
     }
-    saveSettings();
-    refreshAllSelects();
-    renderSettings();
-    render();
   });
   document.getElementById('addSegBtn').addEventListener('click', function () {
     const input = document.getElementById('newSegName');
@@ -1247,7 +1525,7 @@
     if (!name) return;
     if (settings.segments.includes(name)) { alert('이미 있는 결제수단입니다.'); return; }
     settings.segments.push(name);
-    saveSettings();
+    saveSettingsSafe();
     input.value = '';
     refreshAllSelects();
     renderSettings();
@@ -1262,7 +1540,7 @@
       const b = base.seg[s];
       if (b > 0) settings.budgets[s] = Math.round(b * 0.9 / 1000) * 1000;
     });
-    saveSettings();
+    saveSettingsSafe();
     renderSettings();
     render();
   });
@@ -1287,26 +1565,32 @@
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = function () {
+    reader.onload = async function () {
       try {
         const data = JSON.parse(reader.result);
         const txs = Array.isArray(data) ? data : data.transactions;
         if (!Array.isArray(txs)) throw new Error('invalid');
-        if (confirm(`${txs.length}건의 내역을 가져옵니다. 현재 데이터를 덮어쓸까요?`)) {
-          transactions = txs;
-          transactions.forEach(normalizeTx);
+        if (!confirm(`${txs.length}건의 내역을 가져옵니다. Supabase에 저장된 현재 내역 ${transactions.length}건을 모두 지우고 덮어쓸까요?`)) {
+          e.target.value = '';
+          return;
+        }
+        try {
+          await deleteAllTx();
+          await insertManyTx(txs.map(normalizeTx));
           if (!Array.isArray(data) && data.settings) {
             const s = data.settings;
             if (Array.isArray(s.segments) && s.segments.length) settings.segments = s.segments;
             if (s.budgets && typeof s.budgets === 'object') settings.budgets = s.budgets;
             settings.budgetTotal = Number(s.budgetTotal) || 0;
             settings.savingTarget = Number(s.savingTarget) || 0;
-            saveSettings();
+            await saveSettings();
           }
-          saveData();
           refreshAllSelects();
           renderSettings();
           render();
+        } catch (err) {
+          failed('백업을 가져오', err);
+          await reloadFromServer();
         }
       } catch (err) {
         alert('올바른 백업 파일이 아닙니다.');
@@ -1316,11 +1600,16 @@
     reader.readAsText(file);
   });
 
-  document.getElementById('resetBtn').addEventListener('click', function () {
-    if (confirm('모든 내역을 삭제합니다. 계속할까요?')) {
-      transactions = [];
-      saveData();
+  document.getElementById('resetBtn').addEventListener('click', async function () {
+    if (!confirm(`Supabase에 저장된 ${transactions.length}건을 모두 삭제합니다. 되돌릴 수 없습니다. 계속할까요?`)) return;
+    this.disabled = true;
+    try {
+      await deleteAllTx();
       render();
+    } catch (err) {
+      failed('전체 내역을 삭제', err);
+    } finally {
+      this.disabled = false;
     }
   });
 
@@ -1455,7 +1744,7 @@
   document.getElementById('cardEncoding').addEventListener('change', loadCardFile);
   document.getElementById('cardHasHeader').addEventListener('change', renderCardPreview);
 
-  document.getElementById('cardImportBtn').addEventListener('click', function () {
+  document.getElementById('cardImportBtn').addEventListener('click', async function () {
     const hasHeader = document.getElementById('cardHasHeader').checked;
     const dataRows = hasHeader ? cardRows.slice(1) : cardRows;
     const dateIdx = Number(document.getElementById('mapDate').value);
@@ -1465,13 +1754,14 @@
     const segment = document.getElementById('cardSegment').value || UNASSIGNED;
 
     const existingKeys = new Set(transactions.map(t => `${t.date}|${t.amount}|${t.memo}|${t.segment}`));
-    let added = 0, skipped = 0, failed = 0;
+    const pending = [];
+    let skipped = 0, unreadable = 0;
 
     dataRows.forEach(r => {
       const date = parseFlexibleDate(r[dateIdx]);
       const memo = (r[memoIdx] || '').trim();
       let amount = parseAmount(r[amountIdx]);
-      if (!date || isNaN(amount) || amount === 0) { failed++; return; }
+      if (!date || isNaN(amount) || amount === 0) { unreadable++; return; }
 
       let type = 'expense';
       if (typeIdx >= 0) {
@@ -1486,18 +1776,33 @@
       existingKeys.add(key);
 
       const category = type === 'income' ? '기타' : guessCategory(memo);
-      transactions.push({
-        id: Date.now() + added,
+      pending.push({
         date, type, segment, memo, category, amount,
         fixed: type === 'expense' && FIXED_CATEGORIES.includes(category)
       });
-      added++;
     });
 
-    saveData();
-    render();
-    document.getElementById('cardImportCount').textContent =
-      `가져오기 완료: ${added}건 추가(${segment}), ${skipped}건 중복 제외, ${failed}건 인식 실패`;
+    const countEl = document.getElementById('cardImportCount');
+    if (!pending.length) {
+      countEl.textContent = `추가할 내역이 없습니다: ${skipped}건 중복 제외, ${unreadable}건 인식 실패`;
+      return;
+    }
+
+    this.disabled = true;
+    countEl.textContent = `${pending.length}건 업로드 중…`;
+    try {
+      const added = await insertManyTx(pending);
+      render();
+      countEl.textContent =
+        `가져오기 완료: ${added}건 추가(${segment}), ${skipped}건 중복 제외, ${unreadable}건 인식 실패`;
+    } catch (err) {
+      failed('CSV 내역을 저장', err);
+      countEl.textContent = '업로드에 실패했습니다. 서버 상태를 다시 불러옵니다.';
+      await reloadFromServer();
+      render();
+    } finally {
+      this.disabled = false;
+    }
   });
 
   /* ---------- 초기화 ---------- */
@@ -1507,13 +1812,108 @@
     fillSegmentSelect(document.getElementById('cardSegment'), { includeUnassigned: false });
   }
 
-  loadData();
-  document.getElementById('fDate').value = todayStr();
-  document.getElementById('filterMonth').value = currentYM();
-  populateCategoryOptions();
-  refreshAllSelects();
-  renderSettings();
-  render();
+  function redrawAll() {
+    refreshAllSelects();
+    renderSettings();
+    render();
+  }
+
+  async function reloadFromServer() {
+    await loadData();
+    redrawAll();
+    setSync('ok', '동기화됨');
+  }
+
+  /* ---------- 다른 기기의 변경 반영 ---------- */
+  let realtimeTimer = null;
+  function subscribeRealtime() {
+    try {
+      db.channel('ledger')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, queueRefresh)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, queueRefresh)
+        .subscribe();
+    } catch (e) {
+      console.warn('realtime 구독 실패', e);
+    }
+  }
+
+  function queueRefresh() {
+    clearTimeout(realtimeTimer);
+    realtimeTimer = setTimeout(() => {
+      // 편집 중에 폼이 초기화되면 곤란하므로, 편집 중에는 다음 기회로 미룹니다.
+      if (editingId !== null) { queueRefresh(); return; }
+      reloadFromServer().catch(e => console.warn('새로고침 실패', e));
+    }, 500);
+  }
+
+  /* ---------- 기존 localStorage 데이터 옮기기 ---------- */
+  function maybeOfferMigration() {
+    if (transactions.length > 0) return;
+    if (lsGet('household_ledger_migrated') === 'done') return;
+    const legacy = readLegacyLocal();
+    if (!legacy.transactions.length) return;
+
+    document.getElementById('migrateCount').textContent = `${legacy.transactions.length}건`;
+    document.getElementById('migrateBanner').style.display = 'flex';
+
+    document.getElementById('migrateDismissBtn').onclick = function () {
+      document.getElementById('migrateBanner').style.display = 'none';
+    };
+    document.getElementById('migrateBtn').onclick = async function () {
+      this.disabled = true;
+      try {
+        if (legacy.settings) {
+          const s = legacy.settings;
+          if (Array.isArray(s.segments) && s.segments.length) settings.segments = s.segments;
+          if (s.budgets && typeof s.budgets === 'object') settings.budgets = s.budgets;
+          settings.budgetTotal = Number(s.budgetTotal) || 0;
+          settings.savingTarget = Number(s.savingTarget) || 0;
+          await saveSettings();
+        }
+        const added = await insertManyTx(legacy.transactions);
+        lsSet('household_ledger_migrated', 'done');
+        document.getElementById('migrateBanner').style.display = 'none';
+        redrawAll();
+        alert(`${added}건을 Supabase로 옮겼습니다.\n기존 브라우저 데이터는 그대로 남겨두었습니다.`);
+      } catch (err) {
+        failed('기존 데이터를 옮기', err);
+        this.disabled = false;
+        await reloadFromServer().catch(() => {});
+      }
+    };
+  }
+
+  /* ---------- 시작 ---------- */
+  async function boot() {
+    document.getElementById('fDate').value = todayStr();
+    document.getElementById('filterMonth').value = currentYM();
+    populateCategoryOptions();
+
+    if (!db) {
+      setSync('error', 'Supabase 라이브러리를 불러오지 못함');
+      readCache();
+      redrawAll();
+      return;
+    }
+
+    // 캐시가 있으면 먼저 그려서 빈 화면을 보여주지 않습니다.
+    if (readCache()) redrawAll();
+    setSync('', '불러오는 중…');
+
+    try {
+      await loadData();
+      redrawAll();
+      setSync('ok', '동기화됨');
+      maybeOfferMigration();
+      subscribeRealtime();
+    } catch (e) {
+      console.error(e);
+      setSync('error', '오프라인 — 마지막 저장본 표시 중');
+      redrawAll();
+    }
+  }
+
+  boot();
 })();
 </script>
 </body>
